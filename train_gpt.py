@@ -17,7 +17,7 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
-from torch.nn.attention.flex_attention import BlockMask, flex_attention
+from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_block_mask
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
@@ -360,13 +360,18 @@ class MLP(nn.Module):
         super().__init__()
         hdim = 4 * dim
         self.c_fc = CastedLinear(dim, hdim)
+        # self.c_beacon_fc = CastedLinear(dim, hdim)
         self.c_proj = CastedLinear(hdim, dim)
+        # self.beacon_c_proj = CastedLinear(hdim, dim)
+        # self.beacon_c_proj.weight.detach().zero_()
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
 
-    def forward(self, x: Tensor):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
+    def forward(self, x: Tensor, beacon_mask: Tensor):
+        # beacon_mask is a boolean tensor of shape (T)
+        # x_token = self.c_proj(F.relu(self.c_fc(x)).square())
+        # x_beacon = self.beacon_c_proj(F.relu(self.c_beacon_fc(x)).square())
+        # x = torch.where(beacon_mask[None, :, None], x_beacon, x_token)
+        x = self.c_proj(F.relu(self.c_fc(x)).square())
         return x
 
 class Block(nn.Module):
@@ -376,11 +381,11 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
         self.mlp = MLP(dim)
 
-    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, block_mask: BlockMask):
+    def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, block_mask: BlockMask, beacon_mask: Tensor):
         x = lambdas[0] * x + lambdas[1] * x0
         if self.attn is not None:
             x = x + self.attn(norm(x), ve, sa_lambdas, block_mask)
-        x = x + self.mlp(norm(x))
+        x = x + self.mlp(norm(x), beacon_mask)
         return x
 
 # -----------------------------------------------------------------------------
@@ -400,7 +405,7 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=False, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
         self.lm_head.weight.detach().zero_() # @Grad62304977
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
@@ -434,7 +439,7 @@ class GPT(nn.Module):
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
         # manual block mask creation by @YouJiacheng
-        assert len(input_seq) % BLOCK_SIZE == 0
+        assert len(input_seq) % BLOCK_SIZE == 0, f"input_seq length {len(input_seq)} is not a multiple of BLOCK_SIZE {BLOCK_SIZE}"
         NUM_BLOCKS = len(input_seq) // BLOCK_SIZE
         block_idx = torch.arange(NUM_BLOCKS, dtype=torch.int32, device="cuda")
         causal_blockmask_any = block_idx[:, None] >= block_idx
@@ -458,18 +463,38 @@ class GPT(nn.Module):
             )
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
+    
+    def create_beacon_blockmasks(self, input_seq: Tensor):
+        docs = (input_seq == end_of_document_token_id).cumsum(0)
+        is_beacons = (input_seq == beacon_token_id)
+        beacons = 1 + is_beacons.cumsum(0) - is_beacons.long()
 
-    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
+        def document_causal_beacon(b, h, q_idx, kv_idx):
+            causal_mask = q_idx >= kv_idx
+            is_same_document = docs[q_idx] == docs[kv_idx]
+            is_beacon = is_beacons[kv_idx]
+            is_same_beacon_part = beacons[q_idx] == beacons[kv_idx]
+            return causal_mask & (is_beacon | is_same_beacon_part) & is_same_document
+        
+        return create_block_mask(document_causal_beacon, B=None, H=None, Q_LEN=input_seq.size(0), KV_LEN=input_seq.size(0))
+
+    def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, use_beacon: bool = False):
         assert input_seq.ndim == 1
+
+        beacon_mask = input_seq == beacon_token_id
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
         # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
         ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
         assert len(ve) == len(self.blocks)
-
-        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        if not use_beacon:
+            long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
+            block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        else:
+            bm = self.create_beacon_blockmasks(input_seq)
+            block_masks = [bm, bm, bm, bm, bm, bm, bm, bm, bm, bm, bm, bm]
         assert len(block_masks) == len(self.blocks)
+
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
 
@@ -484,7 +509,7 @@ class GPT(nn.Module):
         for i in range(len(self.blocks)):
             if i >= n:
                 x = x + skip_weights[i - n] * skip_connections.pop()
-            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], block_masks[i])
+            x = self.blocks[i](x, ve[i], x0, lambdas[i], sa_lambdas[i], block_masks[i], beacon_mask)
             if i < n:
                 skip_connections.append(x)
 
@@ -525,29 +550,94 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
             start = end
     assert False # increase max_batch_span if necessary
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
+end_of_document_token_id = 50256
+beacon_token_id = 50257
+pad_token_id = 50258
+beacon_offset = 16
+use_beacon = True
+def distributed_data_generator(
+    filename_pattern: str, batch_size: int, align_to_bos: bool, use_beacon: bool = False
+):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
-    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
+    file_iter = iter(
+        files
+    )  # use itertools.cycle(files) instead if you want to do multi-epoch training
     tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
+    max_batch_span = (
+        2 * batch_size if align_to_bos else batch_size
+    )  # provide buffer to handle samples up to length local_batch_size
     while True:
         if pos + max_batch_span + 1 >= len(tokens):
             tokens, pos = _load_data_shard(next(file_iter)), 0
         if align_to_bos:
-            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
+            batch_starts, batch_span = find_batch_starts(
+                tokens, pos, local_batch_size, max_batch_span
+            )
             start_idx = batch_starts[rank]
         else:
             batch_span = batch_size
             start_idx = pos + rank * local_batch_size
-        buf = tokens[start_idx:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
+        buf = tokens[start_idx:][: local_batch_size + 1]
+        if use_beacon:
+            # Inject beacon tokens every beacon_offset^th from end of document
+            eod_mask = buf == end_of_document_token_id
+            eod_idxs = torch.where(eod_mask)[0]
+            boundary_points = sorted(list(set([0] + eod_idxs.tolist() + [len(buf)])))
+            if len(boundary_points) < 2:
+                # No change to buf, logic proceeds with the original buffer.
+                pass
+            else:
+                new_buf_parts = []
+                for start_idx, end_idx in zip(
+                    boundary_points[:-1], boundary_points[1:]
+                ):
+                    # Get the current document segment
+                    segment = buf[start_idx:end_idx]
+
+                    # Skip empty segments which can occur if there are consecutive EOD tokens
+                    if len(segment) == 0:
+                        continue
+
+                    # 4. Inject beacons into the segment.
+                    # This inner loop is the same as your original, but applied to a correctly defined segment.
+                    for j in range(0, len(segment), beacon_offset):
+                        chunk = segment[j : j + beacon_offset]
+                        # To avoid adding a beacon to an empty chunk at the very end
+                        if len(chunk) > 0:
+                            new_buf_parts.append(chunk)
+                            # Don't add a beacon if the last token is already an EOD token.
+                            # This is an optional but good practice to avoid ...<EOD><BEACON>... sequences.
+                            if not (
+                                len(chunk) == beacon_offset
+                                and chunk[-1] == end_of_document_token_id
+                            ):
+                                new_buf_parts.append(
+                                    torch.tensor(
+                                        [beacon_token_id],
+                                        device=buf.device,
+                                        dtype=buf.dtype,
+                                    )
+                                )
+
+            # 5. Reconstruct the buffer if any new parts were created.
+            if new_buf_parts:
+                buf = torch.cat(new_buf_parts)
+                buf = buf[:local_batch_size+1]
+
+
+        inputs = buf[:-1].to(
+            device="cuda", dtype=torch.int32, non_blocking=True
+        )  # no sync on host side;
+        targets = buf[1:].to(
+            device="cuda", dtype=torch.int64, non_blocking=True
+        )  # H2D in another stream isn't helpful.
         pos += batch_span
         yield inputs, targets
+
 
 # -----------------------------------------------------------------------------
 # int main
@@ -561,7 +651,7 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1750 # number of iterations to run
+    num_iterations = 5000 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -578,6 +668,7 @@ torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
 dist.barrier()
 master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
 
 # begin logging
 logfile = None
@@ -660,10 +751,12 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True, use_beacon=use_beacon)
+inputs, targets = next(train_loader)
+print0(inputs[:256].tolist())
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(1)).backward()
+    model(inputs, targets, get_window_size_blocks(1), use_beacon=use_beacon).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -672,11 +765,16 @@ for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del train_loader, initial_state
 
+
 ########################################
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+total_params = sum(p.numel() for p in model.parameters())
+print(f"Total number of parameters: {total_params}")
+
+
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True, use_beacon=use_beacon)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -695,12 +793,13 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False, use_beacon=use_beacon)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
+                targets[targets == beacon_token_id] = -100
+                val_loss += model(inputs, targets, get_window_size_blocks(step), use_beacon=use_beacon)
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
@@ -720,7 +819,8 @@ for step in range(train_steps + 1):
 
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    loss = model(inputs, targets, get_window_size_blocks(step), use_beacon=use_beacon)
+    loss.backward()
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -735,7 +835,7 @@ for step in range(train_steps + 1):
     model.zero_grad(set_to_none=True)
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} loss:{loss:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
