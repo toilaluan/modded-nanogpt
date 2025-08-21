@@ -9,6 +9,7 @@ import glob
 from dataclasses import dataclass
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
+import wandb
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -464,7 +465,7 @@ class GPT(nn.Module):
         # Long-short SWA block masks by @leloykun & @YouJiacheng, adapated from suggestion by @Grad62304977, following Gemma 2 paper
         return build_bm(sliding_window_num_blocks), build_bm(sliding_window_num_blocks // 2)
     
-    def create_beacon_blockmasks(self, input_seq: Tensor):
+    def create_beacon_blockmasks(self, input_seq: Tensor, return_mask_mod = False):
         docs = (input_seq == end_of_document_token_id).cumsum(0)
         is_beacons = (input_seq == beacon_token_id)
         beacons = 1 + is_beacons.cumsum(0) - is_beacons.long()
@@ -475,8 +476,11 @@ class GPT(nn.Module):
             is_beacon = is_beacons[kv_idx]
             is_same_beacon_part = beacons[q_idx] == beacons[kv_idx]
             return causal_mask & (is_beacon | is_same_beacon_part) & is_same_document
+        if return_mask_mod:
+            return document_causal_beacon
         
-        return create_block_mask(document_causal_beacon, B=None, H=None, Q_LEN=input_seq.size(0), KV_LEN=input_seq.size(0))
+        bm = create_block_mask(document_causal_beacon, B=None, H=None, Q_LEN=input_seq.size(0), KV_LEN=input_seq.size(0))
+        return bm
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor, use_beacon: bool = False):
         assert input_seq.ndim == 1
@@ -549,14 +553,65 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
                 return starts, end - pos
             start = end
     assert False # increase max_batch_span if necessary
+@dataclass
+class Hyperparameters:
+    # data
+    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
+    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
+    train_seq_len = 48*1024 # FlexAttention sequence length
+    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    # optimization
+    num_iterations = 5000 # number of iterations to run
+    cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
+    # evaluation and logging
+    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    save_checkpoint = False
+
+
+
+# torchrun sets these env variables
+rank = int(os.environ["RANK"])
+world_size = int(os.environ["WORLD_SIZE"])
+assert world_size == 8 # this code is designed for 8xH100
+assert torch.cuda.is_available()
+device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+torch.cuda.set_device(device)
+dist.init_process_group(backend="nccl", device_id=device)
+dist.barrier()
+master_process = (rank == 0) # this process will do logging, checkpointing etc.
+
+if master_process:
+   wandb.init(project="beacon-gpt")
+
+# begin logging
+logfile = None
+if master_process:
+    run_id = uuid.uuid4()
+    os.makedirs("logs", exist_ok=True)
+    logfile = f"logs/{run_id}.txt"
+    print(logfile)
+def print0(s, console=False):
+    if master_process:
+        with open(logfile, "a") as f:
+            if console:
+                print(s)
+            print(s, file=f)
+
+
+args = Hyperparameters()
 
 end_of_document_token_id = 50256
 beacon_token_id = 50257
 pad_token_id = 50258
-beacon_offset = 16
+beacon_offset = 8
+train_pad_to_seq_len = args.train_seq_len + args.train_seq_len // beacon_offset // 128 * 128 * 2
+val_pad_to_seq_len = args.val_seq_len + args.val_seq_len // beacon_offset // 128 * 128 * 2
+
+print0(f"train_pad_to_seq_len: {train_pad_to_seq_len}, val_pad_to_seq_len: {val_pad_to_seq_len}", console=True)
 use_beacon = True
 def distributed_data_generator(
-    filename_pattern: str, batch_size: int, align_to_bos: bool, use_beacon: bool = False
+    filename_pattern: str, batch_size: int, align_to_bos: bool, use_beacon: bool = False, pad_to_seq_len: int = None
 ):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -628,6 +683,11 @@ def distributed_data_generator(
                 buf = torch.cat(new_buf_parts)
                 buf = buf[:local_batch_size+1]
 
+        if pad_to_seq_len:
+            assert pad_to_seq_len % 128 == 0
+            # assert len(buf) < pad_to_seq_len
+            pad_len = pad_to_seq_len - len(buf)
+            buf = torch.cat([buf, torch.full((pad_len+1,), pad_token_id, device=buf.device, dtype=buf.dtype)])
 
         inputs = buf[:-1].to(
             device="cuda", dtype=torch.int32, non_blocking=True
@@ -635,54 +695,13 @@ def distributed_data_generator(
         targets = buf[1:].to(
             device="cuda", dtype=torch.int64, non_blocking=True
         )  # H2D in another stream isn't helpful.
+        targets[targets == pad_token_id] = -100
         pos += batch_span
         yield inputs, targets
 
 
 # -----------------------------------------------------------------------------
 # int main
-
-@dataclass
-class Hyperparameters:
-    # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
-    # optimization
-    num_iterations = 5000 # number of iterations to run
-    cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
-    # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint = False
-args = Hyperparameters()
-
-# torchrun sets these env variables
-rank = int(os.environ["RANK"])
-world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
-assert torch.cuda.is_available()
-device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
-torch.cuda.set_device(device)
-dist.init_process_group(backend="nccl", device_id=device)
-dist.barrier()
-master_process = (rank == 0) # this process will do logging, checkpointing etc.
-
-
-# begin logging
-logfile = None
-if master_process:
-    run_id = uuid.uuid4()
-    os.makedirs("logs", exist_ok=True)
-    logfile = f"logs/{run_id}.txt"
-    print(logfile)
-def print0(s, console=False):
-    if master_process:
-        with open(logfile, "a") as f:
-            if console:
-                print(s)
-            print(s, file=f)
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -696,7 +715,7 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(train_pad_to_seq_len, val_pad_to_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -751,9 +770,26 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True, use_beacon=use_beacon)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True, use_beacon=use_beacon, pad_to_seq_len=train_pad_to_seq_len)
 inputs, targets = next(train_loader)
-print0(inputs[:256].tolist())
+
+if rank == 0:
+    print(inputs.shape)
+    print("Timing creating beacon mask")
+    for _ in range(5):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        model.create_beacon_blockmasks(inputs, return_mask_mod=False)
+        torch.cuda.synchronize()
+        print0(f"bm_time {(time.perf_counter() - t0)*1000:.2f}ms", console=True)
+    print("Visualizing beacon mask")
+    from viz_mask import visualize_attention_scores
+    short_inputs = inputs[:68]
+    query = torch.ones(1, 1, 68, 64, device="cuda")
+    key = torch.ones(1, 1, 68, 64, device="cuda")
+    mask_mod = model.create_beacon_blockmasks(short_inputs, return_mask_mod=True)
+    visualize_attention_scores(query, key, mask_mod=mask_mod, name="beacon_mask")
+
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1), use_beacon=use_beacon).backward()
@@ -774,7 +810,7 @@ total_params = sum(p.numel() for p in model.parameters())
 print(f"Total number of parameters: {total_params}")
 
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True, use_beacon=use_beacon)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True, use_beacon=use_beacon, pad_to_seq_len=args.train_seq_len)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -793,7 +829,7 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False, use_beacon=use_beacon)
+        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False, use_beacon=use_beacon, pad_to_seq_len=val_pad_to_seq_len)
         val_loss = 0
         with torch.no_grad():
             for _ in range(val_steps):
@@ -804,6 +840,13 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        if master_process:
+            wandb.log(
+                {
+                    "val-loss": val_loss,
+                    "step-avg": training_time_ms/max(step, 1)
+                }
+            )
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -836,6 +879,8 @@ for step in range(train_steps + 1):
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} loss:{loss:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+
+torch.save(model.state_dict(), "model.pt")
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
