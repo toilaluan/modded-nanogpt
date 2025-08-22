@@ -562,7 +562,7 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 5000 # number of iterations to run
+    num_iterations = 20000 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -605,11 +605,13 @@ end_of_document_token_id = 50256
 beacon_token_id = 50257
 pad_token_id = 50258
 beacon_offset = 8
-train_pad_to_seq_len = args.train_seq_len + args.train_seq_len // beacon_offset // 128 * 128 * 2
-val_pad_to_seq_len = args.val_seq_len + args.val_seq_len // beacon_offset // 128 * 128 * 2
-
-print0(f"train_pad_to_seq_len: {train_pad_to_seq_len}, val_pad_to_seq_len: {val_pad_to_seq_len}", console=True)
 use_beacon = True
+if use_beacon:
+    val_pad_to_seq_len = args.val_seq_len + args.val_seq_len // beacon_offset // 128 * 128 * 2
+else:
+    val_pad_to_seq_len = args.val_seq_len
+
+print0(f"val_pad_to_seq_len: {val_pad_to_seq_len}", console=True)
 def distributed_data_generator(
     filename_pattern: str, batch_size: int, align_to_bos: bool, use_beacon: bool = False, pad_to_seq_len: int = None
 ):
@@ -715,7 +717,7 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(train_pad_to_seq_len, val_pad_to_seq_len)).cuda()
+model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, val_pad_to_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -770,7 +772,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True, use_beacon=use_beacon, pad_to_seq_len=train_pad_to_seq_len)
+train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True, use_beacon=use_beacon, pad_to_seq_len=args.train_seq_len)
 inputs, targets = next(train_loader)
 
 if rank == 0:
